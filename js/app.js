@@ -815,13 +815,16 @@
 
   // ---------------------------------------------------------------- 问答（云端 AI）
   const C = { messages: [] };
-  const A = { cloud: null, models: [], modelId: '', convId: '', history: [],
-    generating: false, ctrl: null, state: 'idle' };   // idle | loading | ready | error
+  const A = {
+    models: [], modelId: '', history: [],
+    generating: false, ctrl: null,
+    state: 'idle',      // idle | loading | ready | offline | error
+    err: '', provider: '', maxTokens: 3000
+  };
 
-  function genId() {
-    return (window.crypto && crypto.randomUUID)
-      ? crypto.randomUUID()
-      : 'chat-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
+  /** 同源代理地址；用 file:// 直接打开时没有后端，问答走本地规则 */
+  function aiEndpoint() {
+    return location.protocol === 'file:' ? '' : 'api/chat';
   }
 
   function sysPrompt() {
@@ -842,29 +845,22 @@
     return lines.join('\n');
   }
 
-  function loadSdkScript() {
-    return new Promise((res, rej) => {
-      if (window.WorkBuddyCloud) return res();
-      const s = document.createElement('script');
-      s.src = 'https://cdn.jsdelivr.net/npm/@tencent-ai/workbuddy-cloud-sdk@dev/lib/index.global.js';
-      s.onload = () => res();
-      s.onerror = () => rej(new Error('SDK 载入失败'));
-      document.head.appendChild(s);
-    });
-  }
-
   function errText(e) {
     const code = (e && e.error && e.error.code) || '';
     const msg = (e && e.error && e.error.message) || (e && e.message) || String(e);
+    if (code === 'auth_missing')
+      return '服务端还没有配置模型密钥：请在部署平台的 Environment Variables 里填 LLM_API_KEY 后重新部署。在此之前问答会自动改用本地知识库。';
     if (code.indexOf('auth_') === 0)
-      return 'AI 通道鉴权失败：当前访问来源未获授权，请通过本应用的正式地址访问。';
+      return 'AI 通道鉴权失败：' + msg;
     if (code.indexOf('quota_') === 0)
-      return 'AI 调用额度已用尽或被限流，请稍后再试。';
-    if (code.indexOf('gateway_') === 0 || code.indexOf('model_') === 0)
-      return '模型服务暂时不可用，请稍后点击重新发送。';
+      return '调用被限流或额度用尽，请稍后再试：' + msg;
+    if (code.indexOf('gateway_') === 0)
+      return '模型服务暂时不可用（' + (e && e.status ? 'HTTP ' + e.status : '网关错误') + '），请稍后重试。';
+    if (code.indexOf('model_') === 0)
+      return '该模型不可用，请检查模型名或服务商开通情况。';
     if (code.indexOf('request_') === 0)
       return '请求参数有误：' + msg;
-    if (e instanceof TypeError || /network|fetch|failed/i.test(msg))
+    if (e instanceof TypeError || /network|fetch|failed to fetch|load failed/i.test(msg))
       return '网络不可用：AI 对话需要联网（诊断与推理不受影响，仍在本地）。请检查网络后重试。';
     return 'AI 调用失败：' + msg;
   }
@@ -872,43 +868,83 @@
   function setChatStatus() {
     const dot = $('aiDot'), txt = $('chatStatus');
     if (!dot || !txt) return;
-    dot.className = 'chat-ai-dot ' + (A.state === 'ready' ? 'ready' : A.state === 'error' ? 'error' : 'loading');
-    txt.textContent = A.state === 'ready'
-      ? 'AI 已连接（' + (A.models.find(x => x.id === A.modelId) || {}).name + '）'
-      : A.state === 'loading' ? '正在连接 AI 服务…'
-      : A.state === 'error' ? ('连接失败：' + A.err) : '未连接';
+    const cls = A.state === 'ready' ? 'ready' : (A.state === 'offline' ? 'loading' : A.state === 'error' ? 'error' : 'loading');
+    dot.className = 'chat-ai-dot ' + cls;
+    if (A.state === 'ready') {
+      txt.textContent = 'AI 已连接 · ' + (A.provider || '') + ' · ' + (A.modelId || '');
+    } else if (A.state === 'loading') {
+      txt.textContent = '正在连接 AI 服务…';
+    } else if (A.state === 'offline') {
+      txt.textContent = '未配置密钥 · 已切到本地知识库';
+    } else if (A.state === 'error') {
+      txt.textContent = '连接失败：' + A.err;
+    } else {
+      txt.textContent = '未连接';
+    }
   }
 
   function fillModelSelect() {
     const sel = $('chatModel');
     if (!sel) return;
-    sel.innerHTML = A.models.map(x =>
-      `<option value="${esc(x.id)}" ${x.id === A.modelId ? 'selected' : ''}>${esc(x.name || x.id)}</option>`).join('');
+    if (A.models.length <= 1) { sel.hidden = true; return; }
+    sel.hidden = false;
+    sel.innerHTML = A.models.map(id =>
+      `<option value="${esc(id)}" ${id === A.modelId ? 'selected' : ''}>${esc(id)}</option>`).join('');
   }
 
-  async function ensureCloud() {
-    if (A.cloud) return A.cloud;
-    if (A.state === 'loading') return null;
-    A.state = 'loading'; A.err = ''; setChatStatus();
-    const cfg = window.WB_CLOUD_CONFIG;
+  /**
+   * 问一次 /api/chat?health=1，决定这一页走 AI 还是本地规则。
+   * 关键：不把"后端没配好"当成致命错误 —— 诊断功能与本地问答都不该因此不可用。
+   */
+  async function ensureAI() {
+    if (A.state === 'ready') return true;
+    if (A.state === 'offline' || A.state === 'error') return false;
+    const ep = aiEndpoint();
+    if (!ep) { A.state = 'offline'; A.err = 'file:// 无后端'; setChatStatus(); return false; }
+    A.state = 'loading'; setChatStatus();
     try {
-      if (!cfg || !cfg.endpoint || !cfg.publishableKey) throw new Error('缺少云服务配置');
-      await loadSdkScript();
-      A.cloud = window.WorkBuddyCloud.createWorkBuddyCloud({
-        endpoint: cfg.endpoint,
-        publishableKey: cfg.publishableKey
-      });
-      const models = await A.cloud.llm.models.list();
-      A.models = (models || []).filter(x => x.disabled !== true);
-      if (!A.models.length) throw new Error('当前没有可用模型');
-      A.modelId = A.models[0].id;
-      A.state = 'ready';
-      fillModelSelect(); setChatStatus();
-      return A.cloud;
+      const r = await fetch(ep + '?health=1', { cache: 'no-store' });
+      const h = await r.json();
+      if (h && h.ok) {
+        A.state = 'ready';
+        A.provider = h.providerLabel || h.provider || '';
+        A.models = (h.models && h.models.length) ? h.models : [h.model];
+        A.modelId = h.model;
+        A.maxTokens = h.maxTokens || 3000;
+        fillModelSelect(); setChatStatus();
+        return true;
+      }
+      A.state = 'offline';
+      A.err = h && h.reason === 'missing_key' ? '服务端未配置密钥' : '后端未就绪';
+      setChatStatus();
+      return false;
     } catch (e) {
-      A.state = 'error'; A.err = errText(e); setChatStatus();
-      return null;
+      A.state = 'offline';
+      A.err = '连不上后端';
+      setChatStatus();
+      return false;
     }
+  }
+
+  /** 后端不可用时的兜底：本地规则问答（与小程序同一套逻辑，结论全部来自真实运行数据） */
+  function localAnswer(q) {
+    try {
+      const m = S.meta || {};
+      const r = S.M.qa.answer(q, {
+        latest: S.latestPrediction,
+        metrics: m.metrics || null,
+        perClass: m.perClass || null,
+        confusion: m.confusion || null,
+        history: m.history || null,
+        info: m.info || null,
+        config: m.config || {}
+      });
+      if (r && r.text) return r;
+    } catch (e) { /* 落到下面的兜底文案 */ }
+    return {
+      text: '当前 AI 服务未配置，已使用本地知识库回答，这个问题暂时没有匹配到条目。\n\n可以试试下方的推荐问题，或在「诊断」页跑一条样本后再问结果。',
+      chips: (S.M.qa.QUICK || []).slice(0, 4)
+    };
   }
 
   function viewChat() {
@@ -917,7 +953,7 @@
       <div class="card chat-wrap">
         <div class="chat-toolbar">
           <span class="chat-ai-dot" id="aiDot"></span>
-          <select id="chatModel" class="inp chat-model" title="选择模型"></select>
+          <select id="chatModel" class="inp chat-model" title="选择模型" hidden></select>
           <span class="small muted" id="chatStatus">未连接</span>
         </div>
         <div class="chat-log" id="chatLog"></div>
@@ -927,7 +963,7 @@
           <button class="btn" id="chatClear">清空</button>
         </div>
         <div class="small muted" style="margin-top:8px">
-          问答页已接入云端大模型（流式输出、免密钥）。诊断与推理仍在浏览器本地完成，不上传信号数据；AI 回答由大模型生成，涉及数字请以页面真实数据为准。
+          问答由云端大模型生成（流式输出，密钥只存在服务端）。诊断与推理仍在浏览器本地完成，不上传信号数据；AI 回答中的数字请以页面真实数据为准。
         </div>
       </div>`;
 
@@ -938,7 +974,7 @@
     C.messages = [{ id: 1, role: 'bot', text: hello, chips: S.M.qa.QUICK.slice(0, 3) }];
     renderChat();
     setChatStatus();
-    ensureCloud();
+    ensureAI();
 
     const input = host.querySelector('#chatIn');
     host.querySelector('#chatSend').addEventListener('click', () => {
@@ -948,7 +984,7 @@
     input.addEventListener('keydown', e => { if (e.key === 'Enter' && !A.generating) send(input.value); });
     host.querySelector('#chatClear').addEventListener('click', () => {
       C.messages = [{ id: Date.now(), role: 'bot', text: '对话已清空，已开启新的会话。', chips: S.M.qa.QUICK.slice(0, 3) }];
-      A.history = []; A.convId = '';
+      A.history = [];
       renderChat();
     });
     host.querySelector('#chatModel').addEventListener('change', e => {
@@ -959,31 +995,45 @@
   function setGenerating(on) {
     A.generating = on;
     const btn = document.querySelector('#chatSend');
-    if (btn) { btn.textContent = on ? '停止' : '发送'; }
+    if (btn) btn.textContent = on ? '停止' : '发送';
+  }
+
+  let renderTimer = null;
+  function scheduleRender() {
+    if (renderTimer) return;
+    renderTimer = setTimeout(() => { renderTimer = null; renderChat(); }, 40);
   }
 
   function renderChat() {
     const log = $('chatLog');
     if (!log) return;
+    const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 80;
     log.innerHTML = C.messages.map(m => {
-      if (m.text === '__thinking__') {
-        return `<div class="msg bot"><div class="ava">AI</div><div class="bubble">
-          <span class="typing"><i></i><i></i><i></i></span></div></div>`;
+      let think = '';
+      if (m.reasoning) {
+        const open = m.streaming && !m.text ? ' open' : '';
+        const tip = m.streaming && !m.text ? '（生成中）' : '';
+        think = `<details class="think"${open}><summary>思考过程 · ${m.reasoning.length} 字${tip}</summary>` +
+          `<div class="think-body">${esc(m.reasoning)}</div></details>`;
       }
+      let body;
+      if (m.text) body = esc(m.text) + (m.streaming ? '<span class="stream-cur">▍</span>' : '');
+      else if (m.streaming && !m.reasoning) body = '<span class="typing"><i></i><i></i><i></i></span>';
+      else body = '';
+      if (m.truncated) body += '<div class="small muted" style="margin-top:8px">（输出达到长度上限被截断）</div>';
       const chips = m.chips && m.chips.length
         ? `<div class="chips">${m.chips.map(c => `<button class="chip" data-q="${esc(c)}">${esc(c)}</button>`).join('')}</div>` : '';
-      const cur = m.streaming ? '<span class="stream-cur">▍</span>' : '';
       return `<div class="msg ${m.role}">
         <div class="ava">${m.role === 'bot' ? 'AI' : '我'}</div>
-        <div class="bubble">${esc(m.text)}${cur}${chips}</div></div>`;
+        <div class="bubble">${think}${body}${chips}</div></div>`;
     }).join('');
     log.querySelectorAll('[data-q]').forEach(b => b.addEventListener('click', () => {
       if (!A.generating) send(b.dataset.q);
     }));
-    log.scrollTop = log.scrollHeight;
+    if (atBottom) log.scrollTop = log.scrollHeight;
   }
 
-  async function send(text) {
+  function send(text) {
     const q = String(text || '').trim();
     if (!q || A.generating) return;
     const host = $('view-chat');
@@ -991,54 +1041,82 @@
     C.messages.push({ id: Date.now(), role: 'user', text: q });
     renderChat();
 
-    const cloud = A.cloud || await ensureCloud();
-    if (!cloud || !A.modelId) {
-      C.messages.push({ id: Date.now() + 1, role: 'bot', text: A.err || 'AI 服务当前不可用，请稍后在工具栏查看状态并重试。' });
+    const bot = { id: Date.now() + 2, role: 'bot', text: '', reasoning: '', streaming: true };
+    C.messages.push(bot);
+    renderChat();
+
+    // 后端不可用 → 本地规则直接答，不假装在等模型
+    if (A.state !== 'ready') {
+      if (A.state === 'idle' || A.state === 'loading') {
+        const r = localAnswer(q);
+        bot.text = (r.text || '') + '\n\n（说明：当前没有连上云端模型，以上回答来自本地知识库。配置 LLM_API_KEY 后可获得更自由的追问能力。）';
+        bot.chips = r.chips || [];
+        bot.streaming = false;
+        renderChat();
+        return;
+      }
+      const r = localAnswer(q);
+      bot.text = (r.text || '') + '\n\n（说明：云端 AI 未配置或不可用，以上回答来自本地知识库。）';
+      bot.chips = r.chips || [];
+      bot.streaming = false;
       renderChat();
       return;
     }
 
-    const bot = { id: Date.now() + 2, role: 'bot', text: '', streaming: true };
-    C.messages.push(bot);
-    renderChat();
     setGenerating(true);
     A.history.push({ role: 'user', content: q });
-    if (!A.convId) A.convId = genId();
-
     const messages = [{ role: 'system', content: sysPrompt() }].concat(A.history.slice(-16));
     const ctrl = A.ctrl = new AbortController();
-    let acc = '';
-    try {
-      for await (const chunk of cloud.llm.chat.completions.create({
-        model: A.modelId,
-        messages: messages,
-        stream: true,
-        stream_options: { include_usage: true },
-        conversationId: A.convId,
-        signal: ctrl.signal
-      })) {
-        const delta = chunk.choices && chunk.choices[0] && chunk.choices[0].delta;
-        if (delta && delta.content) {
-          acc += delta.content;
-          bot.text = acc;
-          renderChat();
-        }
+    let acc = '', accThink = '';
+
+    fetch(aiEndpoint(), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: A.modelId, messages: messages, max_tokens: A.maxTokens }),
+      signal: ctrl.signal
+    }).then(res => {
+      if (!res.ok) {
+        return res.json().catch(() => ({})).then(j => {
+          const err = new Error((j && j.error && j.error.message) || ('HTTP ' + res.status));
+          err.status = res.status;
+          err.error = (j && j.error) || { code: 'http_' + res.status, message: err.message };
+          throw err;
+        });
       }
+      return window.VBSSE.readStream(res, (delta, full, kind) => {
+        if (kind === 'reasoning') { accThink = full; bot.reasoning = accThink; }
+        else { acc = full; bot.text = acc; }
+        scheduleRender();
+      }).then(out => {
+        bot.streaming = false;
+        bot.text = (out && out.content) || '';
+        bot.reasoning = (out && out.reasoning) || accThink;
+        bot.truncated = !!(out && out.finish === 'length');
+        if (bot.text) A.history.push({ role: 'assistant', content: bot.text });
+        else if (bot.reasoning) {
+          bot.text = '（模型只输出了思考过程，正文为空。通常是 max_tokens 被思考耗尽，可在服务端调大 CHAT_MAX_TOKENS 或换个问题。）';
+          bot.truncated = true;
+        } else {
+          bot.text = '（模型未返回内容，请重新发送）';
+        }
+      });
+    }).catch(e => {
       bot.streaming = false;
-      bot.text = acc || '（模型未返回内容，请重新发送）';
-      if (acc) A.history.push({ role: 'assistant', content: acc });
-    } catch (e) {
-      bot.streaming = false;
-      if (e && (e.name === 'AbortError' || /abort/i.test(String(e && e.message)))) {
+      const aborted = e && (e.name === 'AbortError' || /abort/i.test(String(e && e.message)));
+      if (aborted) {
         bot.text = acc ? acc + '\n\n[已停止]' : '[已停止生成]';
         if (acc) A.history.push({ role: 'assistant', content: acc });
       } else {
         bot.text = errText(e);
+        if (e && e.error && e.error.code === 'auth_missing') {
+          A.state = 'offline';
+          setChatStatus();
+        }
       }
-    } finally {
+    }).then(() => {
       setGenerating(false);
       renderChat();
-    }
+    });
   }
 
   // ---------------------------------------------------------------- 启动

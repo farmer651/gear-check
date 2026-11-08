@@ -1,0 +1,15 @@
+# 依赖
+node_modules/
+
+# 密钥：绝不提交
+.env
+.env.local
+.env.*.local
+
+# 部署平台
+.vercel
+
+# 系统垃圾
+.DS_Store
+Thumbs.db
+*.log
