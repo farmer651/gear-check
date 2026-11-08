@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>UConn 振动信号智能诊断系统 · 网页版</title>
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+
+<!-- ============ 启动加载屏 ============ -->
+<div id="boot">
+  <div class="boot-box">
+    <div class="boot-title">UConn 振动信号智能诊断系统</div>
+    <div class="boot-sub">正在载入端侧模型与全量数据集（936 条 × 3600 点）</div>
+    <div class="boot-bar"><div id="bootFill"></div></div>
+    <div id="bootText" class="boot-text">准备中…</div>
+    <div class="boot-note">全部推理在浏览器本地完成，不上传任何数据，可断网使用</div>
+  </div>
+</div>
+
+<!-- ============ 主体 ============ -->
+<div id="app" hidden>
+  <aside id="sidebar">
+    <div class="brand">
+      <div class="brand-mark">FD</div>
+      <div class="brand-text">
+        <b>智能故障诊断</b>
+        <span>端侧 CNN-LSTM · 9 类</span>
+      </div>
+    </div>
+    <nav id="nav">
+      <button class="nav-item" data-view="overview"><i>◎</i><span>概览</span></button>
+      <button class="nav-item" data-view="diagnose"><i>⌁</i><span>智能诊断</span></button>
+      <button class="nav-item" data-view="data"><i>▤</i><span>数据集</span></button>
+      <button class="nav-item" data-view="evaluate"><i>▦</i><span>性能评估</span></button>
+      <button class="nav-item" data-view="chat"><i>❝</i><span>交互问答</span></button>
+    </nav>
+    <div class="side-foot">
+      <div class="side-line"><span>推理位置</span><b>浏览器本地</b></div>
+      <div class="side-line"><span>网络依赖</span><b>无</b></div>
+      <div class="side-line"><span>数据规模</span><b id="footTotal">—</b></div>
+    </div>
+  </aside>
+
+  <main id="main">
+    <header id="topbar">
+      <button id="burger" aria-label="菜单">☰</button>
+      <h1 id="viewTitle">概览</h1>
+      <div class="top-right">
+        <span id="modelTag" class="tag">端侧轻量</span>
+        <span id="perfTag" class="tag ghost">—</span>
+      </div>
+    </header>
+
+    <div id="views">
+      <section class="view" id="view-overview"></section>
+      <section class="view" id="view-diagnose" hidden></section>
+      <section class="view" id="view-data" hidden></section>
+      <section class="view" id="view-evaluate" hidden></section>
+      <section class="view" id="view-chat" hidden></section>
+    </div>
+  </main>
+</div>
+
+<div id="toast"></div>
+<div id="mask" hidden><div class="spinner"></div><div id="maskText">计算中…</div></div>
+<div id="modal" hidden>
+  <div class="modal-card">
+    <div id="modalTitle" class="modal-title"></div>
+    <div id="modalBody" class="modal-body"></div>
+    <div class="modal-foot"><button id="modalOk" class="btn primary">知道了</button></div>
+  </div>
+</div>
+
+<script src="js/chart.js"></script>
+<script src="js/cloud-config.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
