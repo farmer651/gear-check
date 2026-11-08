@@ -816,15 +816,66 @@
   // ---------------------------------------------------------------- 问答（云端 AI）
   const C = { messages: [] };
   const A = {
-    models: [], modelId: '', history: [],
+    cloud: null, models: [], modelId: '', history: [], convId: '',
     generating: false, ctrl: null,
     state: 'idle',      // idle | loading | ready | offline | error
+    mode: 'local',      // proxy（自建 /api/chat）| cloud（免密钥云通道）| local（本地规则）
     err: '', provider: '', maxTokens: 3000
   };
 
   /** 同源代理地址；用 file:// 直接打开时没有后端，问答走本地规则 */
   function aiEndpoint() {
     return location.protocol === 'file:' ? '' : 'api/chat';
+  }
+
+  /**
+   * 通道一：自建代理 /api/chat（密钥在服务端，首选）。
+   * 通道二：WorkBuddy 免密钥云通道（cloud-config.js），无需任何后端，
+   *         直接双击 index.html 也能用；缺点只对授权域名放行。
+   * 通道三：本地规则知识库（S.M.qa），断网兜底。
+   */
+  function loadSdkScript() {
+    return new Promise((resolve, reject) => {
+      if (window.WorkBuddyCloud) return resolve();
+      const s = document.createElement('script');
+      s.src = 'https://cdn.jsdelivr.net/npm/@tencent-ai/workbuddy-cloud-sdk@dev/lib/index.global.js';
+      s.onload = () => resolve();
+      s.onerror = () => reject(new Error('SDK 载入失败'));
+      document.head.appendChild(s);
+    });
+  }
+
+  function genId() {
+    return (window.crypto && crypto.randomUUID)
+      ? crypto.randomUUID()
+      : 'chat-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
+  }
+
+  /** 尝试免密钥云通道；成功返回 true */
+  async function tryCloudChannel() {
+    const cfg = window.WB_CLOUD_CONFIG;
+    if (!cfg || !cfg.endpoint || !cfg.publishableKey) return false;
+    try {
+      await loadSdkScript();
+      const cloud = window.WorkBuddyCloud.createWorkBuddyCloud({
+        endpoint: cfg.endpoint,
+        publishableKey: cfg.publishableKey
+      });
+      const list = await cloud.llm.models.list();
+      const models = (list || []).filter(x => x.disabled !== true);
+      if (!models.length) return false;
+      A.cloud = cloud;
+      A.mode = 'cloud';
+      A.provider = '云通道（免密钥）';
+      A.models = models.map(x => x.id);
+      A.modelId = models[0].id;
+      A.providerNames = {};
+      models.forEach(x => { A.providerNames[x.id] = x.name || x.id; });
+      return true;
+    } catch (e) {
+      A.cloud = null;
+      return false;
+    }
   }
 
   function sysPrompt() {
@@ -870,12 +921,16 @@
     if (!dot || !txt) return;
     const cls = A.state === 'ready' ? 'ready' : (A.state === 'offline' ? 'loading' : A.state === 'error' ? 'error' : 'loading');
     dot.className = 'chat-ai-dot ' + cls;
+    const nameOf = id => (A.providerNames && A.providerNames[id]) || id;
     if (A.state === 'ready') {
-      txt.textContent = 'AI 已连接 · ' + (A.provider || '') + ' · ' + (A.modelId || '');
+      const via = A.mode === 'cloud' ? '云通道' : '服务端代理';
+      txt.textContent = 'AI 已连接 · ' + nameOf(A.modelId) + '（' + via + '）';
+      txt.title = '通道：' + (A.provider || A.mode);
     } else if (A.state === 'loading') {
       txt.textContent = '正在连接 AI 服务…';
     } else if (A.state === 'offline') {
-      txt.textContent = '未配置密钥 · 已切到本地知识库';
+      txt.textContent = '无可用 AI 通道 · 已切到本地知识库';
+      txt.title = A.err || '';
     } else if (A.state === 'error') {
       txt.textContent = '连接失败：' + A.err;
     } else {
@@ -889,41 +944,90 @@
     if (A.models.length <= 1) { sel.hidden = true; return; }
     sel.hidden = false;
     sel.innerHTML = A.models.map(id =>
-      `<option value="${esc(id)}" ${id === A.modelId ? 'selected' : ''}>${esc(id)}</option>`).join('');
+      `<option value="${esc(id)}" ${id === A.modelId ? 'selected' : ''}>${esc((A.providerNames && A.providerNames[id]) || id)}</option>`).join('');
   }
 
   /**
-   * 问一次 /api/chat?health=1，决定这一页走 AI 还是本地规则。
-   * 关键：不把"后端没配好"当成致命错误 —— 诊断功能与本地问答都不该因此不可用。
+   * 依次尝试：自建代理 → 免密钥云通道 → 本地规则。
+   * 关键：不把"某条通道没配好"当成致命错误 —— 下一级还能用，诊断更不该受影响。
    */
-  async function ensureAI() {
-    if (A.state === 'ready') return true;
-    if (A.state === 'offline' || A.state === 'error') return false;
-    const ep = aiEndpoint();
-    if (!ep) { A.state = 'offline'; A.err = 'file:// 无后端'; setChatStatus(); return false; }
+  let aiProbe = null;
+  /** 同一时刻只探测一次，多个调用共享同一个 Promise */
+  function ensureAI() {
+    if (A.state === 'ready') return Promise.resolve(true);
+    if (aiProbe) return aiProbe;
+    aiProbe = probeAI().then(
+      v => { aiProbe = null; return v; },
+      () => { aiProbe = null; return false; }
+    );
+    return aiProbe;
+  }
+
+  async function probeAI() {
     A.state = 'loading'; setChatStatus();
-    try {
-      const r = await fetch(ep + '?health=1', { cache: 'no-store' });
-      const h = await r.json();
-      if (h && h.ok) {
-        A.state = 'ready';
-        A.provider = h.providerLabel || h.provider || '';
-        A.models = (h.models && h.models.length) ? h.models : [h.model];
-        A.modelId = h.model;
-        A.maxTokens = h.maxTokens || 3000;
-        fillModelSelect(); setChatStatus();
-        return true;
-      }
-      A.state = 'offline';
-      A.err = h && h.reason === 'missing_key' ? '服务端未配置密钥' : '后端未就绪';
-      setChatStatus();
-      return false;
-    } catch (e) {
-      A.state = 'offline';
-      A.err = '连不上后端';
-      setChatStatus();
-      return false;
+
+    // 1) 自建代理（密钥在服务端，能力最自由）
+    const ep = aiEndpoint();
+    if (ep) {
+      try {
+        const r = await fetch(ep + '?health=1', { cache: 'no-store' });
+        const h = await r.json();
+        if (h && h.ok) {
+          A.state = 'ready';
+          A.mode = 'proxy';
+          A.provider = h.providerLabel || h.provider || '';
+          A.models = (h.models && h.models.length) ? h.models : [h.model];
+          A.modelId = h.model;
+          A.maxTokens = h.maxTokens || 3000;
+          A.providerNames = null;
+          fillModelSelect(); setChatStatus();
+          return true;
+        }
+      } catch (e) { /* 落到下一条通道 */ }
     }
+
+    // 2) 免密钥云通道（无需任何后端，但不是所有域名都放行）
+    if (await tryCloudChannel()) {
+      A.state = 'ready';
+      fillModelSelect(); setChatStatus();
+      return true;
+    }
+
+    // 3) 本地规则知识库
+    A.state = 'offline';
+    A.mode = 'local';
+    A.err = ep ? '代理与云通道均不可用' : '当前以本地文件打开（file://），没有服务端';
+    setChatStatus();
+    return false;
+  }
+
+  /** 云通道的流式调用（与代理的 fetch 分支并列，产出同样的事件形状） */
+  async function streamFromCloud(messages, onDelta, signal) {
+    if (!A.convId) A.convId = genId();
+    let content = '', reasoning = '', finish = '';
+    for await (const chunk of A.cloud.llm.chat.completions.create({
+      model: A.modelId,
+      messages: messages,
+      stream: true,
+      stream_options: { include_usage: true },
+      conversationId: A.convId,
+      signal: signal
+    })) {
+      const ch = chunk && chunk.choices && chunk.choices[0];
+      if (!ch) continue;
+      const d = ch.delta || {};
+      const r = d.reasoning_content != null ? d.reasoning_content : d.reasoning;
+      if (typeof r === 'string' && r) {
+        reasoning += r;
+        onDelta(r, reasoning, 'reasoning');
+      }
+      if (typeof d.content === 'string' && d.content) {
+        content += d.content;
+        onDelta(d.content, content, 'content');
+      }
+      if (ch.finish_reason) finish = ch.finish_reason;
+    }
+    return { content: content, reasoning: reasoning, finish: finish };
   }
 
   /** 后端不可用时的兜底：本地规则问答（与小程序同一套逻辑，结论全部来自真实运行数据） */
@@ -963,7 +1067,7 @@
           <button class="btn" id="chatClear">清空</button>
         </div>
         <div class="small muted" style="margin-top:8px">
-          问答由云端大模型生成（流式输出，密钥只存在服务端）。诊断与推理仍在浏览器本地完成，不上传信号数据；AI 回答中的数字请以页面真实数据为准。
+          问答优先走自建代理（密钥只在服务端），连不上时自动切 WorkBuddy 免密钥云通道，两者都不可用才用本地知识库。诊断与推理始终在浏览器本地完成，不上传信号数据。
         </div>
       </div>`;
 
@@ -984,7 +1088,7 @@
     input.addEventListener('keydown', e => { if (e.key === 'Enter' && !A.generating) send(input.value); });
     host.querySelector('#chatClear').addEventListener('click', () => {
       C.messages = [{ id: Date.now(), role: 'bot', text: '对话已清空，已开启新的会话。', chips: S.M.qa.QUICK.slice(0, 3) }];
-      A.history = [];
+      A.history = []; A.convId = '';
       renderChat();
     });
     host.querySelector('#chatModel').addEventListener('change', e => {
@@ -1033,7 +1137,7 @@
     if (atBottom) log.scrollTop = log.scrollHeight;
   }
 
-  function send(text) {
+  async function send(text) {
     const q = String(text || '').trim();
     if (!q || A.generating) return;
     const host = $('view-chat');
@@ -1045,18 +1149,13 @@
     C.messages.push(bot);
     renderChat();
 
-    // 后端不可用 → 本地规则直接答，不假装在等模型
-    if (A.state !== 'ready') {
-      if (A.state === 'idle' || A.state === 'loading') {
-        const r = localAnswer(q);
-        bot.text = (r.text || '') + '\n\n（说明：当前没有连上云端模型，以上回答来自本地知识库。配置 LLM_API_KEY 后可获得更自由的追问能力。）';
-        bot.chips = r.chips || [];
-        bot.streaming = false;
-        renderChat();
-        return;
-      }
+    // 还没探测过就先探一次；探测中不会重复发起
+    const ready = await ensureAI();
+
+    // 两条 AI 通道都不可用 → 本地规则直接答，并如实标注来源
+    if (!ready) {
       const r = localAnswer(q);
-      bot.text = (r.text || '') + '\n\n（说明：云端 AI 未配置或不可用，以上回答来自本地知识库。）';
+      bot.text = (r.text || '') + '\n\n（说明：当前没有可用的 AI 通道，以上回答来自本地知识库。配置服务端密钥，或通过授权域名访问，即可获得更自由的追问能力。）';
       bot.chips = r.chips || [];
       bot.streaming = false;
       renderChat();
@@ -1068,50 +1167,66 @@
     const messages = [{ role: 'system', content: sysPrompt() }].concat(A.history.slice(-16));
     const ctrl = A.ctrl = new AbortController();
     let acc = '', accThink = '';
+    const onDelta = (delta, full, kind) => {
+      if (kind === 'reasoning') { accThink = full; bot.reasoning = accThink; }
+      else { acc = full; bot.text = acc; }
+      scheduleRender();
+    };
 
-    fetch(aiEndpoint(), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: A.modelId, messages: messages, max_tokens: A.maxTokens }),
-      signal: ctrl.signal
-    }).then(res => {
-      if (!res.ok) {
-        return res.json().catch(() => ({})).then(j => {
-          const err = new Error((j && j.error && j.error.message) || ('HTTP ' + res.status));
-          err.status = res.status;
-          err.error = (j && j.error) || { code: 'http_' + res.status, message: err.message };
-          throw err;
-        });
-      }
-      return window.VBSSE.readStream(res, (delta, full, kind) => {
-        if (kind === 'reasoning') { accThink = full; bot.reasoning = accThink; }
-        else { acc = full; bot.text = acc; }
-        scheduleRender();
-      }).then(out => {
-        bot.streaming = false;
-        bot.text = (out && out.content) || '';
-        bot.reasoning = (out && out.reasoning) || accThink;
-        bot.truncated = !!(out && out.finish === 'length');
-        if (bot.text) A.history.push({ role: 'assistant', content: bot.text });
-        else if (bot.reasoning) {
-          bot.text = '（模型只输出了思考过程，正文为空。通常是 max_tokens 被思考耗尽，可在服务端调大 CHAT_MAX_TOKENS 或换个问题。）';
-          bot.truncated = true;
-        } else {
-          bot.text = '（模型未返回内容，请重新发送）';
+    const run = (A.mode === 'cloud')
+      ? streamFromCloud(messages, onDelta, ctrl.signal)
+      : fetch(aiEndpoint(), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: A.modelId, messages: messages, max_tokens: A.maxTokens }),
+        signal: ctrl.signal
+      }).then(res => {
+        if (!res.ok) {
+          return res.json().catch(() => ({})).then(j => {
+            const err = new Error((j && j.error && j.error.message) || ('HTTP ' + res.status));
+            err.status = res.status;
+            err.error = (j && j.error) || { code: 'http_' + res.status, message: err.message };
+            throw err;
+          });
         }
+        return window.VBSSE.readStream(res, onDelta);
       });
+
+    run.then(out => {
+      bot.streaming = false;
+      bot.text = (out && out.content) || '';
+      bot.reasoning = (out && out.reasoning) || accThink;
+      bot.truncated = !!(out && out.finish === 'length');
+      if (bot.text) A.history.push({ role: 'assistant', content: bot.text });
+      else if (bot.reasoning) {
+        bot.text = '（模型只输出了思考过程，正文为空。通常是 max_tokens 被思考耗尽，可调大 CHAT_MAX_TOKENS 或换个问题。）';
+        bot.truncated = true;
+      } else {
+        bot.text = '（模型未返回内容，请重新发送）';
+      }
     }).catch(e => {
       bot.streaming = false;
       const aborted = e && (e.name === 'AbortError' || /abort/i.test(String(e && e.message)));
       if (aborted) {
         bot.text = acc ? acc + '\n\n[已停止]' : '[已停止生成]';
         if (acc) A.history.push({ role: 'assistant', content: acc });
-      } else {
-        bot.text = errText(e);
-        if (e && e.error && e.error.code === 'auth_missing') {
-          A.state = 'offline';
-          setChatStatus();
-        }
+        return;
+      }
+      // 云通道被域名策略拒绝时，别让用户卡死 —— 就地降级，并说明原因
+      if (A.mode === 'cloud') {
+        A.state = 'offline';
+        A.mode = 'local';
+        setChatStatus();
+        const r = localAnswer(q);
+        bot.text = (r.text || '') + '\n\n（说明：免密钥云通道对当前域名未授权（' + ((e && e.message) || '403') + '），以上回答已改用本地知识库。）';
+        bot.chips = r.chips || [];
+        return;
+      }
+      bot.text = errText(e);
+      if (e && e.error && e.error.code === 'auth_missing') {
+        A.state = 'offline';
+        A.mode = 'local';
+        setChatStatus();
       }
     }).then(() => {
       setGenerating(false);
